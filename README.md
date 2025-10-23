@@ -48,6 +48,7 @@ Esto crea dos contenedores:
 - `docker compose logs -f wireguardcontrolbot`: ver actividad del bot.
 - `docker compose logs -f wireguard`: revisar el servidor WireGuard.
 - `/help` en Telegram: lista completa de comandos disponibles.
+- `/debugpeer <nombre>` desde Telegram genera un diagnóstico del peer (handshake, NAT, reglas `iptables`).
 
 ## Scripts adicionales
 `check_vpn.sh` permite monitorizar el contenedor WireGuard desde el host y enviar alertas por Telegram. Configura las variables `BOT_TOKEN`, `CHAT_ID` y `CONTAINER` mediante variables de entorno o un archivo `.env` en el mismo directorio antes de programarlo con `cron`.
@@ -60,6 +61,14 @@ docker compose exec wireguard ping -c 3 1.1.1.1
 docker compose exec wireguard iptables -t nat -S POSTROUTING
 ```
 Las órdenes anteriores confirman que la interfaz externa se detecta bien, que las reglas se encuentran activas y que el contenedor tiene salida a Internet.
+
+`configs/bin/wg-peer-debug.sh` recopila información útil cuando un cliente no navega (handshake, NAT, `ip_forward`, reglas FORWARD y sugerencias). Ejecútalo dentro del contenedor pasando el nombre del peer o su IP:
+
+```bash
+docker compose exec wireguard /config/bin/wg-peer-debug.sh peer1
+docker compose exec wireguard /config/bin/wg-peer-debug.sh 10.119.153.2
+```
+Puedes lanzar el mismo diagnóstico desde Telegram con `/debugpeer peer1` para recibir el resultado en tu chat privado.
 
 ## Servicios systemd
 Si prefieres systemd en lugar de Docker Compose, puedes usar `systemd/wireguardcontrolbot.service` como base. Ajusta las rutas y variables según tu despliegue.

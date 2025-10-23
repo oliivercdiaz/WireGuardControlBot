@@ -33,6 +33,7 @@ WG_INTERFACE = os.environ.get("WG_INTERFACE", "wg0").strip()
 PING_INTERVAL = int(os.environ.get("PING_INTERVAL", "600"))
 WG_MTU = os.environ.get("WG_MTU", "1420").strip() or "1420"
 WG_CLIENT_DNS = os.environ.get("WG_CLIENT_DNS", "1.1.1.1").strip() or "1.1.1.1"
+WG_DEBUG_SCRIPT = os.environ.get("WG_DEBUG_SCRIPT", "/config/bin/wg-peer-debug.sh").strip() or "/config/bin/wg-peer-debug.sh"
 
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
 
@@ -343,11 +344,15 @@ def cf_update_record_ip(record_id, new_ip):
 # Generación de peers
 # =====================
 def gen_keypair():
-    priv, _, rc = run(["wg", "genkey"])
-    if rc != 0 or not priv: return "", ""
-    pub, _, rc2 = run(["sh", "-lc", f"printf %s {shlex.quote(priv)} | wg pubkey"])
-    if rc2 != 0 or not pub: return "", ""
-    return priv.strip(), pub.strip()
+    priv, err, rc = docker_exec(WG_DOCKER_CONTAINER, "wg genkey")
+    if rc != 0 or not priv:
+        return "", ""
+    priv = priv.strip()
+    pub_cmd = f"printf %s {shlex.quote(priv)} | wg pubkey"
+    pub, err2, rc2 = docker_exec(WG_DOCKER_CONTAINER, pub_cmd)
+    if rc2 != 0 or not pub:
+        return "", ""
+    return priv, pub.strip()
 
 def create_client_conf(name, client_ip, server_pub, endpoint, port, dns=None, mtu=None):
     dns = dns or WG_CLIENT_DNS
@@ -419,6 +424,7 @@ def cmd_help(update, context):
         "/logs — Últimos logs del contenedor WireGuard\n"
         "/uptime — Uptime aproximado\n"
         "/rebootpi — Intentar reiniciar la Raspberry\n"
+        "/debugpeer <peer> — Diagnóstico rápido (handshake/NAT)\n"
     )
     context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode="Markdown")
 
@@ -504,6 +510,9 @@ def cmd_addpeer(update, context):
 
     # Info servidor
     server_pub, listen_port = get_server_info()
+    if not server_pub:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="❌ No pude leer la clave pública del servidor.")
+        return
     endpoint = CF_RECORD_NAME or get_public_ip()
     if not endpoint:
         context.bot.send_message(chat_id=update.effective_chat.id, text="❌ No pude determinar endpoint (dominio/IP).")
@@ -522,6 +531,17 @@ def cmd_addpeer(update, context):
     conf_text = conf_tpl.replace("{CLIENT_PRIVATE}", priv)
     conf_path, png_path, png_stream = save_qr_and_conf(name, conf_text)
 
+    try:
+        if os.path.exists(SERVER_WG0):
+            with open(SERVER_WG0, "a", encoding="utf-8") as f:
+                f.write(
+                    "\n[Peer]\n"
+                    f"PublicKey = {pub}\n"
+                    f"AllowedIPs = {client_ip}/32\n"
+                )
+    except Exception:
+        pass
+
     # 3) Enviar resultado
     msg = (
         f"✅ *Peer creado:* `{name}`\n"
@@ -535,6 +555,30 @@ def cmd_addpeer(update, context):
     # .conf
     with open(conf_path, "rb") as f:
         context.bot.send_document(chat_id=update.effective_chat.id, document=f, filename=os.path.basename(conf_path))
+
+
+def cmd_debugpeer(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    if not context.args:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Uso: /debugpeer <nombre|ip>")
+        return
+
+    target = context.args[0].strip()
+    if not target:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Uso: /debugpeer <nombre|ip>")
+        return
+
+    script = shlex.quote(WG_DEBUG_SCRIPT)
+    argument = shlex.quote(target)
+    out, err, rc = docker_exec(WG_DOCKER_CONTAINER, f"{script} {argument}")
+    text = out or err or "(sin salida)"
+    if rc != 0:
+        text = f"Error {rc}:\n{text}"
+    if len(text) > 3900:
+        text = text[:3900] + "…"
+    context.bot.send_message(chat_id=update.effective_chat.id, text=f"```\n{text}\n```", parse_mode="Markdown")
+
 
 def cmd_delpeer(update, context):
     if not is_authorized(update.effective_user.id):
@@ -771,6 +815,7 @@ def main():
     dp.add_handler(CommandHandler("logs",        cmd_logs,        filters=Filters.chat_type.private))
     dp.add_handler(CommandHandler("uptime",      cmd_uptime,      filters=Filters.chat_type.private))
     dp.add_handler(CommandHandler("rebootpi",    cmd_rebootpi,    filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("debugpeer",   cmd_debugpeer,   filters=Filters.chat_type.private, pass_args=True))
 
     t = threading.Thread(target=monitor_loop, args=(updater.bot,), daemon=True)
     t.start()
