@@ -13,6 +13,7 @@ from urllib.error import URLError, HTTPError
 import glob
 import json
 import io
+import ipaddress
 
 import qrcode
 from PIL import Image
@@ -30,6 +31,9 @@ AUTHORIZED_USERS = {
 WG_DOCKER_CONTAINER = os.environ.get("WG_DOCKER_CONTAINER", "wireguard").strip()
 WG_INTERFACE = os.environ.get("WG_INTERFACE", "wg0").strip()
 PING_INTERVAL = int(os.environ.get("PING_INTERVAL", "600"))
+WG_MTU = os.environ.get("WG_MTU", "1420").strip() or "1420"
+WG_CLIENT_DNS = os.environ.get("WG_CLIENT_DNS", "1.1.1.1").strip() or "1.1.1.1"
+WG_DEBUG_SCRIPT = os.environ.get("WG_DEBUG_SCRIPT", "/config/bin/wg-peer-debug.sh").strip() or "/config/bin/wg-peer-debug.sh"
 
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
 
@@ -40,8 +44,74 @@ CF_ZONE_ID = os.environ.get("CF_ZONE_ID", "").strip()
 CF_RECORD_NAME = os.environ.get("CF_RECORD_NAME", "").strip()
 
 # Rutas montadas en el BOT (según docker-compose)
-CONF_DIR = "/configs/wg_confs"               # clientes *.conf y QR
-SERVER_WG0 = "/configs/wg_confs/wg0.conf"    # wg0.conf del servidor
+DEFAULT_WG_CONFIG = "/config/wg_confs/wg0.conf"
+
+
+def _normalize_path(path: str) -> str:
+    if not path:
+        return ""
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+_raw_server_conf = (os.environ.get("WG_CONFIG_PATH") or "").strip()
+if not _raw_server_conf:
+    _raw_server_conf = DEFAULT_WG_CONFIG
+SERVER_WG0 = _normalize_path(_raw_server_conf) or _normalize_path(DEFAULT_WG_CONFIG)
+
+
+def _candidate_server_paths(filename: str):
+    seen = set()
+    results = []
+
+    env_override = os.environ.get(
+        "WG_SERVER_PUBLICKEY_PATH" if filename == "publickey-server" else "WG_SERVER_PRIVATEKEY_PATH",
+        ""
+    ).strip()
+    if env_override:
+        path = _normalize_path(env_override)
+        if path and path not in seen:
+            results.append(path)
+            seen.add(path)
+
+    conf_dir = os.path.dirname(SERVER_WG0)
+    if conf_dir:
+        for candidate in [
+            os.path.join(conf_dir, filename),
+            os.path.join(os.path.dirname(conf_dir), filename),
+            os.path.join(os.path.dirname(conf_dir), "server", filename),
+        ]:
+            path = _normalize_path(candidate)
+            if path and path not in seen:
+                results.append(path)
+                seen.add(path)
+
+    for candidate in [
+        os.path.join("/config", filename),
+        os.path.join("/config", "server", filename),
+        os.path.join(os.getcwd(), "configs", "server", filename),
+    ]:
+        path = _normalize_path(candidate)
+        if path and path not in seen:
+            results.append(path)
+            seen.add(path)
+
+    return results
+
+
+def _resolve_conf_dir() -> str:
+    env_value = os.environ.get("WG_CLIENTS_DIR")
+    if env_value is not None:
+        env_value = env_value.strip()
+        if env_value:
+            return _normalize_path(env_value)
+
+    candidate = os.path.dirname(SERVER_WG0)
+    if candidate:
+        return _normalize_path(candidate)
+
+    return _normalize_path(os.path.dirname(DEFAULT_WG_CONFIG))
+
+CONF_DIR = _resolve_conf_dir()
 
 # =================
 # Utilidades varias
@@ -116,11 +186,13 @@ def parse_connections(wg_text: str):
 # Mapear nombres e IPs
 # =======================
 def list_client_files():
-    return sorted(glob.glob(os.path.join(CONF_DIR, "*.conf")))
+    if not os.path.isdir(CONF_DIR):
+        return []
+    return sorted(p for p in glob.glob(os.path.join(CONF_DIR, "*.conf")) if os.path.isfile(p))
 
 def parse_client_address(conf_path):
     try:
-        with open(conf_path, "r") as f:
+        with open(conf_path, "r", encoding="utf-8") as f:
             text = f.read()
         m = re.search(r"(?mi)^Address\s*=\s*([0-9./]+)", text)
         if m:
@@ -131,7 +203,7 @@ def parse_client_address(conf_path):
     return ""
 
 def build_name_map():
-    """ip -> name usando /configs/wg_confs/<name>.conf"""
+    """ip -> name usando los ficheros de cliente almacenados en CONF_DIR"""
     mapping = {}
     for p in list_client_files():
         name = os.path.splitext(os.path.basename(p))[0]
@@ -155,30 +227,74 @@ def get_server_info():
     Devuelve (public_key, listen_port).
     """
     txt = get_wg_show()
-    m_pub = re.search(r"public key:\s*([A-Za-z0-9+/=]+)", txt)
-    m_port= re.search(r"listening port:\s*(\d+)", txt)
-    return (m_pub.group(1) if m_pub else ""), (m_port.group(1) if m_port else "51820")
+    pub = ""
+    port = ""
 
-def get_subnet_base_and_prefix():
-    """
-    Intenta leer subnet del SERVER_WG0: Address = 10.119.153.1/24
-    Devuelve ("10.119.153.", "24")
-    """
-    base, prefix = "10.0.0.", "24"
+    if txt and not txt.startswith("Error ejecutando wg show"):
+        m_pub = re.search(r"public key:\s*([A-Za-z0-9+/=]+)", txt)
+        m_port = re.search(r"listening port:\s*(\d+)", txt)
+        if m_pub:
+            pub = m_pub.group(1)
+        if m_port:
+            port = m_port.group(1)
+
+    if not port and os.path.exists(SERVER_WG0):
+        try:
+            with open(SERVER_WG0, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.search(r"(?mi)^ListenPort\s*=\s*(\d+)", line)
+                    if m:
+                        port = m.group(1)
+                        break
+        except Exception:
+            port = ""
+
+    if not pub:
+        for path in _candidate_server_paths("publickey-server"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    pub = content.splitlines()[0].strip()
+                    if pub:
+                        break
+            except Exception:
+                continue
+
+    if not pub:
+        for path in _candidate_server_paths("privatekey-server"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    priv = f.read().strip().splitlines()[0].strip()
+            except Exception:
+                priv = ""
+            if not priv:
+                continue
+            pub_cmd = f"printf %s {shlex.quote(priv)} | wg pubkey"
+            out, err, rc = docker_exec(WG_DOCKER_CONTAINER, pub_cmd)
+            if rc == 0 and out.strip():
+                pub = out.strip().splitlines()[0].strip()
+                if pub:
+                    break
+
+    return pub, (port or "51820")
+
+def get_server_network():
+    """Devuelve (network, server_ip) a partir del Address del servidor."""
+    default_network = ipaddress.ip_network("10.0.0.0/24")
+    default_ip = ipaddress.ip_address("10.0.0.1")
+
     try:
-        with open(SERVER_WG0, "r") as f:
+        with open(SERVER_WG0, "r", encoding="utf-8") as f:
             text = f.read()
-        m = re.search(r"(?mi)^Address\s*=\s*([0-9.]+)/(\\d+)", text)
-        if not m:
-            m = re.search(r"(?mi)^Address\s*=\s*([0-9.]+)/(\\d+)", text.replace("\\", ""))
+        m = re.search(r"(?mi)^Address\s*=\s*([0-9.:/]+)", text)
         if m:
-            ip = m.group(1)
-            prefix = m.group(2)
-            parts = ip.split(".")
-            base = ".".join(parts[:3]) + "."
+            iface = ipaddress.ip_interface(m.group(1).strip())
+            return iface.network, iface.ip
     except Exception:
         pass
-    return base, prefix
+
+    return default_network, default_ip
 
 def find_next_free_ip():
     """
@@ -186,8 +302,8 @@ def find_next_free_ip():
     - Revisa wg show (AllowedIPs) y ficheros .conf existentes
     - Empieza en .2 (asumimos .1 es servidor)
     """
-    base, _ = get_subnet_base_and_prefix()
-    used = set()
+    network, server_ip = get_server_network()
+    used = {str(server_ip)}
 
     # wg show
     for p in parse_connections(get_wg_show()):
@@ -201,8 +317,8 @@ def find_next_free_ip():
         if ip:
             used.add(ip)
 
-    for host in range(2, 255):
-        candidate = f"{base}{host}"
+    for host in network.hosts():
+        candidate = str(host)
         if candidate not in used:
             return candidate
     return ""
@@ -315,13 +431,19 @@ def cf_update_record_ip(record_id, new_ip):
 # Generación de peers
 # =====================
 def gen_keypair():
-    priv, _, rc = run(["wg", "genkey"])
-    if rc != 0 or not priv: return "", ""
-    pub, _, rc2 = run(["sh", "-lc", f"printf %s {shlex.quote(priv)} | wg pubkey"])
-    if rc2 != 0 or not pub: return "", ""
-    return priv.strip(), pub.strip()
+    priv, err, rc = docker_exec(WG_DOCKER_CONTAINER, "wg genkey")
+    if rc != 0 or not priv:
+        return "", ""
+    priv = priv.strip()
+    pub_cmd = f"printf %s {shlex.quote(priv)} | wg pubkey"
+    pub, err2, rc2 = docker_exec(WG_DOCKER_CONTAINER, pub_cmd)
+    if rc2 != 0 or not pub:
+        return "", ""
+    return priv, pub.strip()
 
-def create_client_conf(name, client_ip, server_pub, endpoint, port, dns="1.1.1.1", mtu="1420"):
+def create_client_conf(name, client_ip, server_pub, endpoint, port, dns=None, mtu=None):
+    dns = dns or WG_CLIENT_DNS
+    mtu = mtu or WG_MTU
     return (
         "[Interface]\n"
         f"Address = {client_ip}/32\n"
@@ -338,8 +460,12 @@ def create_client_conf(name, client_ip, server_pub, endpoint, port, dns="1.1.1.1
 def save_qr_and_conf(name, text_conf):
     # Guarda .conf en disco
     conf_path = os.path.join(CONF_DIR, f"{name}.conf")
-    with open(conf_path, "w") as f:
+    with open(conf_path, "w", encoding="utf-8") as f:
         f.write(text_conf)
+    try:
+        os.chmod(conf_path, 0o600)
+    except Exception:
+        pass
 
     # Genera QR en memoria y en disco
     img = qrcode.make(text_conf)
@@ -385,6 +511,7 @@ def cmd_help(update, context):
         "/logs — Últimos logs del contenedor WireGuard\n"
         "/uptime — Uptime aproximado\n"
         "/rebootpi — Intentar reiniciar la Raspberry\n"
+        "/debugpeer <peer> — Diagnóstico rápido (handshake/NAT)\n"
     )
     context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode="Markdown")
 
@@ -470,6 +597,9 @@ def cmd_addpeer(update, context):
 
     # Info servidor
     server_pub, listen_port = get_server_info()
+    if not server_pub:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="❌ No pude leer la clave pública del servidor.")
+        return
     endpoint = CF_RECORD_NAME or get_public_ip()
     if not endpoint:
         context.bot.send_message(chat_id=update.effective_chat.id, text="❌ No pude determinar endpoint (dominio/IP).")
@@ -488,6 +618,17 @@ def cmd_addpeer(update, context):
     conf_text = conf_tpl.replace("{CLIENT_PRIVATE}", priv)
     conf_path, png_path, png_stream = save_qr_and_conf(name, conf_text)
 
+    try:
+        if os.path.exists(SERVER_WG0):
+            with open(SERVER_WG0, "a", encoding="utf-8") as f:
+                f.write(
+                    "\n[Peer]\n"
+                    f"PublicKey = {pub}\n"
+                    f"AllowedIPs = {client_ip}/32\n"
+                )
+    except Exception:
+        pass
+
     # 3) Enviar resultado
     msg = (
         f"✅ *Peer creado:* `{name}`\n"
@@ -501,6 +642,30 @@ def cmd_addpeer(update, context):
     # .conf
     with open(conf_path, "rb") as f:
         context.bot.send_document(chat_id=update.effective_chat.id, document=f, filename=os.path.basename(conf_path))
+
+
+def cmd_debugpeer(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    if not context.args:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Uso: /debugpeer <nombre|ip>")
+        return
+
+    target = context.args[0].strip()
+    if not target:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Uso: /debugpeer <nombre|ip>")
+        return
+
+    script = shlex.quote(WG_DEBUG_SCRIPT)
+    argument = shlex.quote(target)
+    out, err, rc = docker_exec(WG_DOCKER_CONTAINER, f"{script} {argument}")
+    text = out or err or "(sin salida)"
+    if rc != 0:
+        text = f"Error {rc}:\n{text}"
+    if len(text) > 3900:
+        text = text[:3900] + "…"
+    context.bot.send_message(chat_id=update.effective_chat.id, text=f"```\n{text}\n```", parse_mode="Markdown")
+
 
 def cmd_delpeer(update, context):
     if not is_authorized(update.effective_user.id):
@@ -737,6 +902,7 @@ def main():
     dp.add_handler(CommandHandler("logs",        cmd_logs,        filters=Filters.chat_type.private))
     dp.add_handler(CommandHandler("uptime",      cmd_uptime,      filters=Filters.chat_type.private))
     dp.add_handler(CommandHandler("rebootpi",    cmd_rebootpi,    filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("debugpeer",   cmd_debugpeer,   filters=Filters.chat_type.private, pass_args=True))
 
     t = threading.Thread(target=monitor_loop, args=(updater.bot,), daemon=True)
     t.start()
