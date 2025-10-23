@@ -1,0 +1,17 @@
+[Unit]
+Description=WireGuardControlBot (Telegram automation)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/wireguard-control/.env
+WorkingDirectory=/opt/wireguard-control
+ExecStart=/usr/bin/docker compose --env-file /opt/wireguard-control/.env up --build
+ExecStop=/usr/bin/docker compose --env-file /opt/wireguard-control/.env down
+TimeoutStartSec=0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
