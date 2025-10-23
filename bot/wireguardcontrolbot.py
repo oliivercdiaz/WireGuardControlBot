@@ -59,6 +59,45 @@ if not _raw_server_conf:
 SERVER_WG0 = _normalize_path(_raw_server_conf) or _normalize_path(DEFAULT_WG_CONFIG)
 
 
+def _candidate_server_paths(filename: str):
+    seen = set()
+    results = []
+
+    env_override = os.environ.get(
+        "WG_SERVER_PUBLICKEY_PATH" if filename == "publickey-server" else "WG_SERVER_PRIVATEKEY_PATH",
+        ""
+    ).strip()
+    if env_override:
+        path = _normalize_path(env_override)
+        if path and path not in seen:
+            results.append(path)
+            seen.add(path)
+
+    conf_dir = os.path.dirname(SERVER_WG0)
+    if conf_dir:
+        for candidate in [
+            os.path.join(conf_dir, filename),
+            os.path.join(os.path.dirname(conf_dir), filename),
+            os.path.join(os.path.dirname(conf_dir), "server", filename),
+        ]:
+            path = _normalize_path(candidate)
+            if path and path not in seen:
+                results.append(path)
+                seen.add(path)
+
+    for candidate in [
+        os.path.join("/config", filename),
+        os.path.join("/config", "server", filename),
+        os.path.join(os.getcwd(), "configs", "server", filename),
+    ]:
+        path = _normalize_path(candidate)
+        if path and path not in seen:
+            results.append(path)
+            seen.add(path)
+
+    return results
+
+
 def _resolve_conf_dir() -> str:
     env_value = os.environ.get("WG_CLIENTS_DIR")
     if env_value is not None:
@@ -188,9 +227,57 @@ def get_server_info():
     Devuelve (public_key, listen_port).
     """
     txt = get_wg_show()
-    m_pub = re.search(r"public key:\s*([A-Za-z0-9+/=]+)", txt)
-    m_port= re.search(r"listening port:\s*(\d+)", txt)
-    return (m_pub.group(1) if m_pub else ""), (m_port.group(1) if m_port else "51820")
+    pub = ""
+    port = ""
+
+    if txt and not txt.startswith("Error ejecutando wg show"):
+        m_pub = re.search(r"public key:\s*([A-Za-z0-9+/=]+)", txt)
+        m_port = re.search(r"listening port:\s*(\d+)", txt)
+        if m_pub:
+            pub = m_pub.group(1)
+        if m_port:
+            port = m_port.group(1)
+
+    if not port and os.path.exists(SERVER_WG0):
+        try:
+            with open(SERVER_WG0, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.search(r"(?mi)^ListenPort\s*=\s*(\d+)", line)
+                    if m:
+                        port = m.group(1)
+                        break
+        except Exception:
+            port = ""
+
+    if not pub:
+        for path in _candidate_server_paths("publickey-server"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    pub = content.splitlines()[0].strip()
+                    if pub:
+                        break
+            except Exception:
+                continue
+
+    if not pub:
+        for path in _candidate_server_paths("privatekey-server"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    priv = f.read().strip().splitlines()[0].strip()
+            except Exception:
+                priv = ""
+            if not priv:
+                continue
+            pub_cmd = f"printf %s {shlex.quote(priv)} | wg pubkey"
+            out, err, rc = docker_exec(WG_DOCKER_CONTAINER, pub_cmd)
+            if rc == 0 and out.strip():
+                pub = out.strip().splitlines()[0].strip()
+                if pub:
+                    break
+
+    return pub, (port or "51820")
 
 def get_server_network():
     """Devuelve (network, server_ip) a partir del Address del servidor."""

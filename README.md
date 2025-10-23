@@ -62,13 +62,18 @@ docker compose exec wireguard iptables -t nat -S POSTROUTING
 ```
 Las órdenes anteriores confirman que la interfaz externa se detecta bien, que las reglas se encuentran activas y que el contenedor tiene salida a Internet.
 
-`configs/bin/wg-peer-debug.sh` recopila información útil cuando un cliente no navega (handshake, NAT, `ip_forward`, reglas FORWARD y sugerencias). Ejecútalo dentro del contenedor pasando el nombre del peer o su IP:
+### Diagnóstico cuando un cliente no tiene Internet
 
-```bash
-docker compose exec wireguard /config/bin/wg-peer-debug.sh peer1
-docker compose exec wireguard /config/bin/wg-peer-debug.sh 10.119.153.2
-```
-Puedes lanzar el mismo diagnóstico desde Telegram con `/debugpeer peer1` para recibir el resultado en tu chat privado.
+1. Conéctate al contenedor y lanza el script de diagnóstico. Verás si el peer está cargado, cuándo fue el último handshake, las reglas `iptables` y sugerencias concretas.
+
+   `configs/bin/wg-peer-debug.sh` recopila información útil cuando un cliente no navega (handshake, NAT, `ip_forward`, reglas FORWARD y sugerencias). Ejecútalo dentro del contenedor pasando el nombre del peer o su IP:
+
+   ```bash
+   docker compose exec wireguard /config/bin/wg-peer-debug.sh peer1
+   docker compose exec wireguard /config/bin/wg-peer-debug.sh 10.119.153.2
+   ```
+
+2. Si estás fuera de casa y sólo tienes el móvil, abre Telegram y envía `/debugpeer peer1`. El bot ejecutará el mismo script dentro del contenedor y te devolverá los resultados en tu chat privado, para que sepas al instante si falta NAT, si el peer no ha hecho handshake o si hay problemas con DNS.
 
 ## Servicios systemd
 Si prefieres systemd en lugar de Docker Compose, puedes usar `systemd/wireguardcontrolbot.service` como base. Ajusta las rutas y variables según tu despliegue.
