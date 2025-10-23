@@ -13,6 +13,7 @@ from urllib.error import URLError, HTTPError
 import glob
 import json
 import io
+import ipaddress
 
 import qrcode
 from PIL import Image
@@ -190,26 +191,22 @@ def get_server_info():
     m_port= re.search(r"listening port:\s*(\d+)", txt)
     return (m_pub.group(1) if m_pub else ""), (m_port.group(1) if m_port else "51820")
 
-def get_subnet_base_and_prefix():
-    """
-    Intenta leer subnet del SERVER_WG0: Address = 10.119.153.1/24
-    Devuelve ("10.119.153.", "24")
-    """
-    base, prefix = "10.0.0.", "24"
+def get_server_network():
+    """Devuelve (network, server_ip) a partir del Address del servidor."""
+    default_network = ipaddress.ip_network("10.0.0.0/24")
+    default_ip = ipaddress.ip_address("10.0.0.1")
+
     try:
-        with open(SERVER_WG0, "r") as f:
+        with open(SERVER_WG0, "r", encoding="utf-8") as f:
             text = f.read()
-        m = re.search(r"(?mi)^Address\s*=\s*([0-9.]+)/(\\d+)", text)
-        if not m:
-            m = re.search(r"(?mi)^Address\s*=\s*([0-9.]+)/(\\d+)", text.replace("\\", ""))
+        m = re.search(r"(?mi)^Address\s*=\s*([0-9.:/]+)", text)
         if m:
-            ip = m.group(1)
-            prefix = m.group(2)
-            parts = ip.split(".")
-            base = ".".join(parts[:3]) + "."
+            iface = ipaddress.ip_interface(m.group(1).strip())
+            return iface.network, iface.ip
     except Exception:
         pass
-    return base, prefix
+
+    return default_network, default_ip
 
 def find_next_free_ip():
     """
@@ -217,8 +214,8 @@ def find_next_free_ip():
     - Revisa wg show (AllowedIPs) y ficheros .conf existentes
     - Empieza en .2 (asumimos .1 es servidor)
     """
-    base, _ = get_subnet_base_and_prefix()
-    used = set()
+    network, server_ip = get_server_network()
+    used = {str(server_ip)}
 
     # wg show
     for p in parse_connections(get_wg_show()):
@@ -232,8 +229,8 @@ def find_next_free_ip():
         if ip:
             used.add(ip)
 
-    for host in range(2, 255):
-        candidate = f"{base}{host}"
+    for host in network.hosts():
+        candidate = str(host)
         if candidate not in used:
             return candidate
     return ""
