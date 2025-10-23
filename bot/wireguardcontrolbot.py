@@ -30,6 +30,8 @@ AUTHORIZED_USERS = {
 WG_DOCKER_CONTAINER = os.environ.get("WG_DOCKER_CONTAINER", "wireguard").strip()
 WG_INTERFACE = os.environ.get("WG_INTERFACE", "wg0").strip()
 PING_INTERVAL = int(os.environ.get("PING_INTERVAL", "600"))
+WG_MTU = os.environ.get("WG_MTU", "1420").strip() or "1420"
+WG_CLIENT_DNS = os.environ.get("WG_CLIENT_DNS", "1.1.1.1").strip() or "1.1.1.1"
 
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
 
@@ -40,8 +42,9 @@ CF_ZONE_ID = os.environ.get("CF_ZONE_ID", "").strip()
 CF_RECORD_NAME = os.environ.get("CF_RECORD_NAME", "").strip()
 
 # Rutas montadas en el BOT (según docker-compose)
-CONF_DIR = "/configs/wg_confs"               # clientes *.conf y QR
-SERVER_WG0 = "/configs/wg_confs/wg0.conf"    # wg0.conf del servidor
+DEFAULT_WG_CONFIG = "/config/wg_confs/wg0.conf"
+SERVER_WG0 = os.environ.get("WG_CONFIG_PATH", DEFAULT_WG_CONFIG).strip() or DEFAULT_WG_CONFIG
+CONF_DIR = os.environ.get("WG_CLIENTS_DIR", os.path.dirname(SERVER_WG0)) or os.path.dirname(DEFAULT_WG_CONFIG)
 
 # =================
 # Utilidades varias
@@ -131,7 +134,7 @@ def parse_client_address(conf_path):
     return ""
 
 def build_name_map():
-    """ip -> name usando /configs/wg_confs/<name>.conf"""
+    """ip -> name usando los ficheros de cliente almacenados en CONF_DIR"""
     mapping = {}
     for p in list_client_files():
         name = os.path.splitext(os.path.basename(p))[0]
@@ -321,7 +324,9 @@ def gen_keypair():
     if rc2 != 0 or not pub: return "", ""
     return priv.strip(), pub.strip()
 
-def create_client_conf(name, client_ip, server_pub, endpoint, port, dns="1.1.1.1", mtu="1420"):
+def create_client_conf(name, client_ip, server_pub, endpoint, port, dns=None, mtu=None):
+    dns = dns or WG_CLIENT_DNS
+    mtu = mtu or WG_MTU
     return (
         "[Interface]\n"
         f"Address = {client_ip}/32\n"
