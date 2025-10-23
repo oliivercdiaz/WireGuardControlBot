@@ -21,8 +21,9 @@ Automatiza la gestión de un servidor WireGuard desplegado con Docker y lo integ
    Rellena `.env` con tus valores reales. Este archivo no se versiona y contiene credenciales.
 
 3. **Revisa/ajusta la configuración de WireGuard**
-   - `configs/templates/server.conf`: plantilla que usa el contenedor `linuxserver/wireguard`.
-   - `configs/wg_confs/wg0.conf`: configuración generada. Puedes regenerarla con el contenedor o editarla manualmente si conoces el formato.
+   - `configs/templates/server.conf`: plantilla que usa el contenedor `linuxserver/wireguard`. Llama al script `configs/bin/wg-nat.sh` para detectar automáticamente la interfaz física y asegurar las reglas de `iptables` necesarias para dar salida a Internet a los clientes.
+   - `configs/bin/wg-nat.sh`: script idempotente que añade o retira las reglas `MASQUERADE` y `FORWARD`. Si cambias la subred o la interfaz del host, edita aquí primero.
+   - `configs/wg_confs/`: el contenedor lo rellena automáticamente en el primer arranque con `wg0.conf` y los peers creados. Consulta `configs/wg_confs/README.md` para saber cómo regenerarlo sin exponer claves.
 
 4. **Configura el bot de Telegram**
    - `TELEGRAM_TOKEN`: token del bot.
@@ -50,6 +51,15 @@ Esto crea dos contenedores:
 
 ## Scripts adicionales
 `check_vpn.sh` permite monitorizar el contenedor WireGuard desde el host y enviar alertas por Telegram. Configura las variables `BOT_TOKEN`, `CHAT_ID` y `CONTAINER` mediante variables de entorno o un archivo `.env` en el mismo directorio antes de programarlo con `cron`.
+
+`configs/bin/wg-nat.sh` puede ejecutarse manualmente dentro del contenedor si necesitas volver a aplicar las reglas de NAT tras modificar la red:
+
+```bash
+docker compose exec wireguard /config/bin/wg-nat.sh up wg0
+docker compose exec wireguard ping -c 3 1.1.1.1
+docker compose exec wireguard iptables -t nat -S POSTROUTING
+```
+Las órdenes anteriores confirman que la interfaz externa se detecta bien, que las reglas se encuentran activas y que el contenedor tiene salida a Internet.
 
 ## Servicios systemd
 Si prefieres systemd en lugar de Docker Compose, puedes usar `systemd/wireguardcontrolbot.service` como base. Ajusta las rutas y variables según tu despliegue.

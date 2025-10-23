@@ -3,3 +3,8 @@
 .env.*.local
 __pycache__/
 *.pyc
+
+# Configuración sensible generada por WireGuard
+configs/server/privatekey-server
+configs/wg_confs/*.conf
+configs/wg_confs/*.png
