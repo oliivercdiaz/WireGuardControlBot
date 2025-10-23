@@ -8,3 +8,5 @@ __pycache__/
 configs/server/privatekey-server
 configs/wg_confs/*.conf
 configs/wg_confs/*.png
+.env
+configs/wg_confs/
