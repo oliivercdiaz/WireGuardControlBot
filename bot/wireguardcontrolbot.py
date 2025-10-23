@@ -127,6 +127,41 @@ def run(cmd, timeout=30):
     except Exception as e:
         return "", str(e), 1
 
+
+def ensure_container_running():
+    out, err, rc = run(["docker", "inspect", "-f", "{{.State.Running}}", WG_DOCKER_CONTAINER])
+    if rc != 0:
+        return False, f"Error consultando el contenedor {WG_DOCKER_CONTAINER}: {(err or out).strip()}"
+
+    if out.strip().lower() == "true":
+        return True, ""
+
+    out, err, rc = run(["docker", "start", WG_DOCKER_CONTAINER])
+    if rc != 0:
+        return False, f"No pude iniciar {WG_DOCKER_CONTAINER}: {(err or out).strip()}"
+
+    return True, ""
+
+
+def ensure_wg_interface_ready():
+    ok, message = ensure_container_running()
+    if not ok:
+        return False, message
+
+    check_cmd = f"ip link show {shlex.quote(WG_INTERFACE)} >/dev/null 2>&1"
+    _, _, rc = docker_exec(WG_DOCKER_CONTAINER, check_cmd)
+    if rc == 0:
+        return True, ""
+
+    up_cmd = f"wg-quick up {shlex.quote(WG_INTERFACE)}"
+    out, err, rc = docker_exec(WG_DOCKER_CONTAINER, up_cmd)
+    if rc != 0:
+        reason = (err or out or "wg-quick up falló").strip()
+        return False, f"wg-quick up devolvió error: {reason}"
+
+    return True, ""
+
+
 def docker_exec(container, inner_cmd, timeout=30):
     cmd = ["docker", "exec", "-i", container, "sh", "-lc", inner_cmd]
     return run(cmd, timeout=timeout)
@@ -572,6 +607,15 @@ def cmd_addpeer(update, context):
         return
     ensure_dir()
 
+    ready, error_msg = ensure_wg_interface_ready()
+    if not ready:
+        context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"❌ No pude preparar la interfaz `{WG_INTERFACE}`: {error_msg}",
+            parse_mode="Markdown",
+        )
+        return
+
     # Nombre
     name = (context.args[0].strip() if context.args else "").lower()
     if not name:
@@ -656,6 +700,15 @@ def cmd_debugpeer(update, context):
         context.bot.send_message(chat_id=update.effective_chat.id, text="Uso: /debugpeer <nombre|ip>")
         return
 
+    ready, error_msg = ensure_wg_interface_ready()
+    if not ready:
+        context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"❌ No pude preparar la interfaz `{WG_INTERFACE}`: {error_msg}",
+            parse_mode="Markdown",
+        )
+        return
+
     script = shlex.quote(WG_DEBUG_SCRIPT)
     argument = shlex.quote(target)
     out, err, rc = docker_exec(WG_DOCKER_CONTAINER, f"{script} {argument}")
@@ -677,6 +730,15 @@ def cmd_delpeer(update, context):
     client_path = os.path.join(CONF_DIR, f"{name}.conf")
     if not os.path.exists(client_path):
         context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ No existe {client_path}")
+        return
+
+    ready, error_msg = ensure_wg_interface_ready()
+    if not ready:
+        context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"❌ No pude preparar la interfaz `{WG_INTERFACE}`: {error_msg}",
+            parse_mode="Markdown",
+        )
         return
 
     # 1) IP del peer

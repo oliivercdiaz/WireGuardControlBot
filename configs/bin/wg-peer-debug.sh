@@ -167,7 +167,26 @@ printf "• %s\n" "$forward_in"
 printf "• %s\n" "$ip_forward"
 printf "• Ruta hacia Internet: %s\n" "$default_route"
 
-echo "\nSugerencias:" 
+echo ""
+echo "Últimos eventos relacionados con WireGuard:"  
+printed_logs=0
+if command -v dmesg >/dev/null 2>&1; then
+    echo "--- dmesg | grep -i wireguard (tail -n 10) ---"
+    dmesg | grep -i wireguard 2>/dev/null | tail -n 10
+    printed_logs=1
+fi
+for log_path in /config/log/wireguard.log /config/log/wg-quick.log /var/log/syslog; do
+    if [ -f "$log_path" ]; then
+        echo "--- ${log_path} (tail -n 10) ---"
+        tail -n 10 "$log_path"
+        printed_logs=1
+    fi
+done
+if [ "$printed_logs" -eq 0 ]; then
+    echo "(no encontré logs locales, revisa docker logs wireguard)"
+fi
+
+echo "\nSugerencias:"
 if [ -z "$peer_key" ]; then
     echo "- Importa la configuración en el cliente y asegúrate de que el QR coincide con el último /addpeer."
     echo "- Comprueba que el puerto UDP ${SERVERPORT:-51820} esté abierto en tu router/Cloudflare."

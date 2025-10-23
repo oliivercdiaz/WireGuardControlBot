@@ -48,7 +48,7 @@ Esto crea dos contenedores:
 - `docker compose logs -f wireguardcontrolbot`: ver actividad del bot.
 - `docker compose logs -f wireguard`: revisar el servidor WireGuard.
 - `/help` en Telegram: lista completa de comandos disponibles.
-- `/debugpeer <nombre>` desde Telegram genera un diagnóstico del peer (handshake, NAT, reglas `iptables`).
+- `/debugpeer <nombre>` desde Telegram genera un diagnóstico del peer (handshake, NAT, reglas `iptables`, últimos logs).
 
 ## Scripts adicionales
 `check_vpn.sh` permite monitorizar el contenedor WireGuard desde el host y enviar alertas por Telegram. Configura las variables `BOT_TOKEN`, `CHAT_ID` y `CONTAINER` mediante variables de entorno o un archivo `.env` en el mismo directorio antes de programarlo con `cron`.
@@ -64,7 +64,7 @@ Las órdenes anteriores confirman que la interfaz externa se detecta bien, que l
 
 ### Diagnóstico cuando un cliente no tiene Internet
 
-1. Conéctate al contenedor y lanza el script de diagnóstico. Verás si el peer está cargado, cuándo fue el último handshake, las reglas `iptables` y sugerencias concretas.
+1. Conéctate al contenedor y lanza el script de diagnóstico. Verás si el peer está cargado, cuándo fue el último handshake, las reglas `iptables`, los últimos eventos del kernel y los logs disponibles, junto con sugerencias concretas.
 
    `configs/bin/wg-peer-debug.sh` recopila información útil cuando un cliente no navega (handshake, NAT, `ip_forward`, reglas FORWARD y sugerencias). Ejecútalo dentro del contenedor pasando el nombre del peer o su IP:
 
@@ -73,7 +73,9 @@ Las órdenes anteriores confirman que la interfaz externa se detecta bien, que l
    docker compose exec wireguard /config/bin/wg-peer-debug.sh 10.119.153.2
    ```
 
-2. Si estás fuera de casa y sólo tienes el móvil, abre Telegram y envía `/debugpeer peer1`. El bot ejecutará el mismo script dentro del contenedor y te devolverá los resultados en tu chat privado, para que sepas al instante si falta NAT, si el peer no ha hecho handshake o si hay problemas con DNS.
+2. Si estás fuera de casa y sólo tienes el móvil, abre Telegram y envía `/debugpeer peer1`. El bot comprobará que el contenedor WireGuard esté en marcha, levantará la interfaz si hiciera falta y ejecutará el mismo script dentro del contenedor para devolverte los resultados en tu chat privado: sabrás al instante si falta NAT, si el peer no ha hecho handshake, si hay eventos de error en los logs o si hay problemas con DNS.
+
+> ℹ️ `/addpeer` y `/delpeer` también verifican que el contenedor `wireguard` y la interfaz `wg0` estén activos antes de tocar la configuración, evitando el error “Unable to modify interface: No such device”.
 
 ## Servicios systemd
 Si prefieres systemd en lugar de Docker Compose, puedes usar `systemd/wireguardcontrolbot.service` como base. Ajusta las rutas y variables según tu despliegue.
