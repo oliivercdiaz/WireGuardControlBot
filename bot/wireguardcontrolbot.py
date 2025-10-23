@@ -43,8 +43,34 @@ CF_RECORD_NAME = os.environ.get("CF_RECORD_NAME", "").strip()
 
 # Rutas montadas en el BOT (según docker-compose)
 DEFAULT_WG_CONFIG = "/config/wg_confs/wg0.conf"
-SERVER_WG0 = os.environ.get("WG_CONFIG_PATH", DEFAULT_WG_CONFIG).strip() or DEFAULT_WG_CONFIG
-CONF_DIR = os.environ.get("WG_CLIENTS_DIR", os.path.dirname(SERVER_WG0)) or os.path.dirname(DEFAULT_WG_CONFIG)
+
+
+def _normalize_path(path: str) -> str:
+    if not path:
+        return ""
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+_raw_server_conf = (os.environ.get("WG_CONFIG_PATH") or "").strip()
+if not _raw_server_conf:
+    _raw_server_conf = DEFAULT_WG_CONFIG
+SERVER_WG0 = _normalize_path(_raw_server_conf) or _normalize_path(DEFAULT_WG_CONFIG)
+
+
+def _resolve_conf_dir() -> str:
+    env_value = os.environ.get("WG_CLIENTS_DIR")
+    if env_value is not None:
+        env_value = env_value.strip()
+        if env_value:
+            return _normalize_path(env_value)
+
+    candidate = os.path.dirname(SERVER_WG0)
+    if candidate:
+        return _normalize_path(candidate)
+
+    return _normalize_path(os.path.dirname(DEFAULT_WG_CONFIG))
+
+CONF_DIR = _resolve_conf_dir()
 
 # =================
 # Utilidades varias
@@ -119,11 +145,13 @@ def parse_connections(wg_text: str):
 # Mapear nombres e IPs
 # =======================
 def list_client_files():
-    return sorted(glob.glob(os.path.join(CONF_DIR, "*.conf")))
+    if not os.path.isdir(CONF_DIR):
+        return []
+    return sorted(p for p in glob.glob(os.path.join(CONF_DIR, "*.conf")) if os.path.isfile(p))
 
 def parse_client_address(conf_path):
     try:
-        with open(conf_path, "r") as f:
+        with open(conf_path, "r", encoding="utf-8") as f:
             text = f.read()
         m = re.search(r"(?mi)^Address\s*=\s*([0-9./]+)", text)
         if m:
@@ -343,8 +371,12 @@ def create_client_conf(name, client_ip, server_pub, endpoint, port, dns=None, mt
 def save_qr_and_conf(name, text_conf):
     # Guarda .conf en disco
     conf_path = os.path.join(CONF_DIR, f"{name}.conf")
-    with open(conf_path, "w") as f:
+    with open(conf_path, "w", encoding="utf-8") as f:
         f.write(text_conf)
+    try:
+        os.chmod(conf_path, 0o600)
+    except Exception:
+        pass
 
     # Genera QR en memoria y en disco
     img = qrcode.make(text_conf)

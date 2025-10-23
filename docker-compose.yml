@@ -35,6 +35,7 @@ services:
       - WG_CLIENTS_DIR=/config/wg_confs
       - WG_DOCKER_CONTAINER=wireguard
       - WG_MTU=1420
+      - WG_CLIENT_DNS=1.1.1.1
     volumes:
       - ./configs:/config
       - /var/run/docker.sock:/var/run/docker.sock
