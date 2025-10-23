@@ -1,0 +1,10 @@
+{
+  "test": {
+    "ip": "10.119.153.5/32",
+    "public_key": "0d4W/gq/B5o1sOu1FxyxzspNYufuVDqCvwECkKuAbxo="
+  },
+  "test2": {
+    "ip": "10.119.153.6/32",
+    "public_key": "UjmxtoGpCvostVkJXmB1yuXe4YGY2F24Nvb8UZN0owI="
+  }
+}
