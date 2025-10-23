@@ -32,6 +32,7 @@ services:
       - AUTHORIZED_USERS=${AUTHORIZED_USERS}
       - WG_INTERFACE=wg0
       - WG_CONFIG_PATH=/config/wg_confs/wg0.conf
+      - WG_CLIENTS_DIR=/config/wg_confs
       - WG_DOCKER_CONTAINER=wireguard
       - WG_MTU=1420
     volumes:
