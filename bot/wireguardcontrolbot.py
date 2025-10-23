@@ -1,266 +1,748 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import json
-import asyncio
-import socket
+import re
+import shlex
+import subprocess
+import threading
 import time
-import statistics
-import logging
-import docker
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.error import TelegramError
-from subprocess import run, PIPE
+from datetime import datetime, timedelta
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+import glob
+import json
+import io
 
-# ========= Config =========
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-AUTHORIZED_USERS = [int(u) for u in os.getenv("AUTHORIZED_USERS", "").split(",") if u.strip()]
-WG_CONTAINER_NAME = os.getenv("WG_DOCKER_CONTAINER", "wireguard")
-WG_INTERFACE = os.getenv("WG_INTERFACE", "wg0")
-WG_CONFIG_PATH = os.getenv("WG_CONFIG_PATH", "/etc/wireguard/wg0.conf")
-WG_MTU = int(os.getenv("WG_MTU", "1420"))
-PING_INTERVAL = int(os.getenv("PING_INTERVAL", "300"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-STATE_FILE = "/configs/bot_state.json"
+import qrcode
+from PIL import Image
 
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("wg-control-bot")
-docker_client = docker.from_env()
+import telegram
+from telegram.ext import Updater, CommandHandler, Filters
 
-# ========= Helpers =========
-def load_state():
+# =========================
+# Config por entorno
+# =========================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+AUTHORIZED_USERS = {
+    u.strip() for u in os.environ.get("AUTHORIZED_USERS", "").split(",") if u.strip()
+}
+WG_DOCKER_CONTAINER = os.environ.get("WG_DOCKER_CONTAINER", "wireguard").strip()
+WG_INTERFACE = os.environ.get("WG_INTERFACE", "wg0").strip()
+PING_INTERVAL = int(os.environ.get("PING_INTERVAL", "600"))
+
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+
+# Cloudflare
+USE_CLOUDFLARE = os.environ.get("USE_CLOUDFLARE", "false").lower() == "true"
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
+CF_ZONE_ID = os.environ.get("CF_ZONE_ID", "").strip()
+CF_RECORD_NAME = os.environ.get("CF_RECORD_NAME", "").strip()
+
+# Rutas montadas en el BOT (según docker-compose)
+CONF_DIR = "/configs/wg_confs"               # clientes *.conf y QR
+SERVER_WG0 = "/configs/wg_confs/wg0.conf"    # wg0.conf del servidor
+
+# =================
+# Utilidades varias
+# =================
+def run(cmd, timeout=30):
     try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {"notifications": True}
-
-def save_state(st):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(st, f)
+        p = subprocess.run(
+            cmd if isinstance(cmd, list) else shlex.split(cmd),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, text=True
+        )
+        return p.stdout.strip(), p.stderr.strip(), p.returncode
     except Exception as e:
-        log.warning(f"No pude guardar estado: {e}")
+        return "", str(e), 1
 
-STATE = load_state()
+def docker_exec(container, inner_cmd, timeout=30):
+    cmd = ["docker", "exec", "-i", container, "sh", "-lc", inner_cmd]
+    return run(cmd, timeout=timeout)
 
-def only_auth(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else None
-        if uid not in AUTHORIZED_USERS:
-            if update.message:
-                await update.message.reply_text("⛔ No estás autorizado para usar este bot.")
-            return
-        return await func(update, context)
-    return wrapper
-
-def container_ok():
-    try:
-        c = docker_client.containers.get(WG_CONTAINER_NAME)
-        return c.status == "running"
-    except Exception:
-        return False
-
-def container_exec(cmd, timeout=10):
-    c = docker_client.containers.get(WG_CONTAINER_NAME)
-    exec_id = docker_client.api.exec_create(c.id, cmd, stdout=True, stderr=True)
-    output = docker_client.api.exec_start(exec_id, demux=True, stream=False)
-    if isinstance(output, tuple):
-        out = (output[0] or b"") + (output[1] or b"")
-    else:
-        out = output or b""
-    insp = docker_client.api.exec_inspect(exec_id)
-    return insp.get("ExitCode", 1), out.decode(errors="ignore")
-
-def restart_wireguard():
-    try:
-        docker_client.containers.get(WG_CONTAINER_NAME).restart()
+def is_authorized(user_id: int) -> bool:
+    if not AUTHORIZED_USERS:
         return True
+    return str(user_id) in AUTHORIZED_USERS
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# ===========================
+# WireGuard: lectura de estado
+# ===========================
+WG_PEER_BLOCK = re.compile(r"^peer:\s*(?P<key>[A-Za-z0-9+/=]+)$", re.M)
+WG_LATEST  = re.compile(r"latest handshake:\s*(?P<text>.+)")
+WG_TRANSFER= re.compile(r"transfer:\s*(?P<text>.+)")
+WG_ENDPOINT= re.compile(r"endpoint:\s*(?P<text>.+)")
+WG_ALLOWED = re.compile(r"allowed ips:\s*(?P<text>.+)")
+
+IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+def get_wg_show():
+    out, err, rc = docker_exec(WG_DOCKER_CONTAINER, "wg show")
+    if rc != 0:
+        return f"Error ejecutando wg show: {err or out}".strip()
+    return out or "(sin salida)"
+
+def parse_connections(wg_text: str):
+    lines = wg_text.splitlines()
+    peers, current = [], []
+    for line in lines:
+        if line.startswith("peer: "):
+            if current:
+                peers.append("\n".join(current))
+                current = []
+        if line.strip():
+            current.append(line)
+    if current:
+        peers.append("\n".join(current))
+
+    result = []
+    for block in peers:
+        mkey = WG_PEER_BLOCK.search(block)
+        if not mkey:
+            continue
+        key = mkey.group("key")
+        endpoint = (WG_ENDPOINT.search(block).group("text") if WG_ENDPOINT.search(block) else "—")
+        allowed  = (WG_ALLOWED.search(block).group("text")  if WG_ALLOWED.search(block)  else "—")
+        latest   = (WG_LATEST.search(block).group("text")   if WG_LATEST.search(block)   else "—")
+        transfer = (WG_TRANSFER.search(block).group("text") if WG_TRANSFER.search(block) else "—")
+        result.append({"key": key, "endpoint": endpoint, "allowed": allowed, "latest": latest, "transfer": transfer})
+    return result
+
+# =======================
+# Mapear nombres e IPs
+# =======================
+def list_client_files():
+    return sorted(glob.glob(os.path.join(CONF_DIR, "*.conf")))
+
+def parse_client_address(conf_path):
+    try:
+        with open(conf_path, "r") as f:
+            text = f.read()
+        m = re.search(r"(?mi)^Address\s*=\s*([0-9./]+)", text)
+        if m:
+            ip = m.group(1).split("/")[0].strip()
+            return ip
+    except Exception:
+        pass
+    return ""
+
+def build_name_map():
+    """ip -> name usando /configs/wg_confs/<name>.conf"""
+    mapping = {}
+    for p in list_client_files():
+        name = os.path.splitext(os.path.basename(p))[0]
+        ip = parse_client_address(p)
+        if ip:
+            mapping[ip] = name
+    return mapping
+
+def find_pubkey_by_allowed_ip(wg_peers, ip):
+    for p in wg_peers:
+        allowed = p.get("allowed", "")
+        if ip and ip in allowed:
+            return p.get("key", "")
+    return ""
+
+# =======================
+# Info del servidor WG
+# =======================
+def get_server_info():
+    """
+    Devuelve (public_key, listen_port).
+    """
+    txt = get_wg_show()
+    m_pub = re.search(r"public key:\s*([A-Za-z0-9+/=]+)", txt)
+    m_port= re.search(r"listening port:\s*(\d+)", txt)
+    return (m_pub.group(1) if m_pub else ""), (m_port.group(1) if m_port else "51820")
+
+def get_subnet_base_and_prefix():
+    """
+    Intenta leer subnet del SERVER_WG0: Address = 10.119.153.1/24
+    Devuelve ("10.119.153.", "24")
+    """
+    base, prefix = "10.0.0.", "24"
+    try:
+        with open(SERVER_WG0, "r") as f:
+            text = f.read()
+        m = re.search(r"(?mi)^Address\s*=\s*([0-9.]+)/(\\d+)", text)
+        if not m:
+            m = re.search(r"(?mi)^Address\s*=\s*([0-9.]+)/(\\d+)", text.replace("\\", ""))
+        if m:
+            ip = m.group(1)
+            prefix = m.group(2)
+            parts = ip.split(".")
+            base = ".".join(parts[:3]) + "."
+    except Exception:
+        pass
+    return base, prefix
+
+def find_next_free_ip():
+    """
+    Busca una IP libre dentro de la /24:
+    - Revisa wg show (AllowedIPs) y ficheros .conf existentes
+    - Empieza en .2 (asumimos .1 es servidor)
+    """
+    base, _ = get_subnet_base_and_prefix()
+    used = set()
+
+    # wg show
+    for p in parse_connections(get_wg_show()):
+        m = IP_RE.search(p.get("allowed", ""))
+        if m:
+            used.add(m.group(1))
+
+    # conf locales
+    for p in list_client_files():
+        ip = parse_client_address(p)
+        if ip:
+            used.add(ip)
+
+    for host in range(2, 255):
+        candidate = f"{base}{host}"
+        if candidate not in used:
+            return candidate
+    return ""
+
+# =======================
+# Render visual del estado
+# =======================
+def human_last_seen(latest: str):
+    t = (latest or "").lower().strip()
+    if not t or t in ("—", "never"):
+        return "🔴", "sin conexión"
+    if "now" in t or "ahora" in t:
+        return "🟢", "ahora"
+
+    mins = secs = 0
+    h = re.search(r"(\d+)\s*hour", t);   mins += (int(h.group(1))*60 if h else 0)
+    m = re.search(r"(\d+)\s*minute", t); mins += (int(m.group(1)) if m else 0)
+    s = re.search(r"(\d+)\s*second", t); secs += (int(s.group(1)) if s else 0)
+    seconds = mins*60 + secs or (30 if any(x in t for x in ["second","minute","hour"]) else 999999)
+
+    if seconds <= 120:  return "🟢", f"hace ~{seconds}s"
+    if seconds <= 900:  return "🟡", f"hace ~{seconds//60}m"
+    return "🔴", f"hace ~{max(1, seconds//60)}m"
+
+def summarize_visual(wg_text: str, public_ip: str, domain: str, started_action: str) -> str:
+    peers = parse_connections(wg_text)
+    ip2name = build_name_map()
+
+    active, recent, inactive = [], [], []
+    for p in peers:
+        m = IP_RE.search(p.get("allowed",""))
+        ip = m.group(1) if m else ""
+        name = ip2name.get(ip, None)
+        display = f"`{name}`" if name else f"`{p['key'][:10]}…`"
+        emoji, seen = human_last_seen(p["latest"])
+        line = f"{emoji} {display} — {seen}"
+        if emoji == "🟢": active.append(line)
+        elif emoji == "🟡": recent.append(line)
+        else: inactive.append(line)
+
+    parts = []
+    parts.append(f"✅ *WireGuard {started_action}*")
+    parts.append(f"📅 {now_str()}")
+    if public_ip: parts.append(f"🌐 IP pública: [{public_ip}](https://{public_ip})")
+    if domain:    parts.append(f"🔗 Dominio: [{domain}](https://{domain})")
+
+    parts.append(f"\n📡 *Peers configurados:* {len(peers)}")
+    if active:
+        parts.append(f"🟢 *Activos ({len(active)})*")
+        parts.extend([f"• {x}" for x in active])
+    if recent:
+        parts.append(f"🟡 *Recientes ({len(recent)})*")
+        parts.extend([f"• {x}" for x in recent])
+    if inactive:
+        parts.append(f"🔴 *Inactivos ({len(inactive)})*")
+        parts.extend([f"• {x}" for x in inactive])
+    return "\n".join(parts)
+
+# =========================
+# Cloudflare & IP pública
+# =========================
+def http_json(method, url, headers=None, body=None, timeout=20):
+    req = Request(url, method=method)
+    if headers:
+        for k,v in (headers or {}).items(): req.add_header(k,v)
+    data = body.encode("utf-8") if body is not None else None
+    try:
+        with urlopen(req, data=data, timeout=timeout) as resp:
+            txt = resp.read().decode("utf-8")
+            try: return json.loads(txt), None
+            except Exception: return {"raw": txt}, None
+    except HTTPError as e:
+        try: return json.loads(e.read().decode("utf-8")), f"HTTP {e.code}"
+        except Exception: return None, f"HTTP {e.code}"
+    except URLError as e:
+        return None, str(e)
     except Exception as e:
-        log.error(f"Error reiniciando WG: {e}")
-        return False
+        return None, str(e)
 
 def get_public_ip():
     try:
-        r = run(["curl", "-s", "https://api.ipify.org"], stdout=PIPE, stderr=PIPE, text=True, timeout=8)
-        return r.stdout.strip() or "Desconocida"
-    except Exception:
-        return "Desconocida"
-
-def ping_host(host="1.1.1.1", count=4):
+        data, _ = http_json("GET", "https://api.ipify.org?format=json")
+        if data and "ip" in data: return data["ip"]
+    except Exception: pass
     try:
-        r = run(["ping", "-c", str(count), "-W", "2", host], stdout=PIPE, stderr=PIPE, text=True, timeout=10)
-        if r.returncode == 0:
-            times = [float(line.split("time=")[1].split()[0])
-                     for line in r.stdout.splitlines() if "time=" in line]
-            if times:
-                return True, {"avg": round(statistics.mean(times), 2),
-                              "min": round(min(times), 2),
-                              "max": round(max(times), 2),
-                              "samples": len(times)}
-        start = time.perf_counter()
-        with socket.create_connection(("1.1.1.1", 53), timeout=2):
-            pass
-        elapsed = (time.perf_counter() - start) * 1000
-        return True, {"avg": round(elapsed, 2), "tcp": True}
-    except Exception:
-        return False, {}
+        data, _ = http_json("GET", "https://ifconfig.me")
+        if data and "raw" in data: return data["raw"].strip()
+    except Exception: pass
+    return ""
 
-def parse_wg_show(text):
-    peers, current = [], {}
-    for line in text.splitlines():
-        if line.startswith("peer:"):
-            if current:
-                peers.append(current)
-            current = {"peer": line.split("peer:")[1].strip()}
-        elif "allowed ips:" in line:
-            current["ips"] = line.split("allowed ips:")[1].strip()
-        elif "latest handshake:" in line:
-            current["handshake"] = line.split("latest handshake:")[1].strip()
-    if current:
-        peers.append(current)
-    return peers
+def cf_get_record_ip():
+    if not (CF_API_TOKEN and CF_ZONE_ID and CF_RECORD_NAME): return None, ""
+    url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records?type=A&name={CF_RECORD_NAME}"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
+    data, _ = http_json("GET", url, headers=headers)
+    if not data or not data.get("success"): return None, ""
+    result = data.get("result") or []
+    if not result: return None, ""
+    rec = result[0]
+    return rec.get("id"), rec.get("content", "")
 
-# ========= Commands =========
-@only_auth
-async def cmd_start(update, ctx):
-    await update.message.reply_text(
-        "👋 Hola! WireGuardControlBot v2.1 activo ✅\n\n"
-        "Comandos disponibles:\n"
-        "/status - Estado del servidor\n"
-        "/restart - Reiniciar WireGuard\n"
-        "/clients - Lista de peers conectados\n"
-        "/latency - Ping a 1.1.1.1\n"
-        "/addpeer <nombre> - Crear un nuevo peer\n"
-        "/report - Informe completo"
+def cf_update_record_ip(record_id, new_ip):
+    url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records/{record_id}"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
+    body = json.dumps({"type": "A", "name": CF_RECORD_NAME, "content": new_ip, "ttl": 120, "proxied": False})
+    data, _ = http_json("PUT", url, headers=headers, body=body)
+    return bool(data and data.get("success"))
+
+# =====================
+# Generación de peers
+# =====================
+def gen_keypair():
+    priv, _, rc = run(["wg", "genkey"])
+    if rc != 0 or not priv: return "", ""
+    pub, _, rc2 = run(["sh", "-lc", f"printf %s {shlex.quote(priv)} | wg pubkey"])
+    if rc2 != 0 or not pub: return "", ""
+    return priv.strip(), pub.strip()
+
+def create_client_conf(name, client_ip, server_pub, endpoint, port, dns="1.1.1.1", mtu="1420"):
+    return (
+        "[Interface]\n"
+        f"Address = {client_ip}/32\n"
+        f"PrivateKey = {{CLIENT_PRIVATE}}\n"
+        f"DNS = {dns}\n"
+        f"MTU = {mtu}\n\n"
+        "[Peer]\n"
+        f"PublicKey = {server_pub}\n"
+        f"AllowedIPs = 0.0.0.0/0, ::/0\n"
+        f"Endpoint = {endpoint}:{port}\n"
+        "PersistentKeepalive = 25\n"
     )
 
-@only_auth
-async def cmd_status(update, ctx):
-    ok = container_ok()
-    ip = get_public_ip()
-    if ok:
-        code, out = container_exec(f"wg show {WG_INTERFACE}")
-        peers = parse_wg_show(out)
-        msg = f"🟢 WireGuard activo\n🌐 IP: {ip}\n👥 Peers: {len(peers)}"
-    else:
-        msg = f"🔴 WireGuard detenido\n🌐 IP: {ip}"
-    await update.message.reply_text(msg)
+def save_qr_and_conf(name, text_conf):
+    # Guarda .conf en disco
+    conf_path = os.path.join(CONF_DIR, f"{name}.conf")
+    with open(conf_path, "w") as f:
+        f.write(text_conf)
 
-@only_auth
-async def cmd_restart(update, ctx):
-    await update.message.reply_text("♻️ Reiniciando WireGuard…")
-    msg = "✅ Reiniciado" if restart_wireguard() else "❌ Error al reiniciar"
-    await update.message.reply_text(msg)
+    # Genera QR en memoria y en disco
+    img = qrcode.make(text_conf)
+    png_path = os.path.join(CONF_DIR, f"{name}.png")
+    img.save(png_path)
 
-@only_auth
-async def cmd_clients(update, ctx):
-    if not container_ok():
-        await update.message.reply_text("🔴 WG no está corriendo.")
-        return
-    code, out = container_exec(f"wg show {WG_INTERFACE}")
-    peers = parse_wg_show(out)
-    if not peers:
-        await update.message.reply_text("Sin peers configurados.")
-        return
-    lines = [f"👥 {len(peers)} peers:"]
-    for i, p in enumerate(peers, 1):
-        lines.append(f"{i}. {p.get('ips','-')} | {p.get('handshake','-')}")
-    await update.message.reply_text("\n".join(lines))
+    # Stream para enviar por Telegram
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    bio.seek(0)
+    return conf_path, png_path, bio
 
-@only_auth
-async def cmd_latency(update, ctx):
-    ok, data = ping_host("1.1.1.1", 4)
-    if ok:
-        await update.message.reply_text(f"⏱️ Latencia promedio: {data['avg']} ms")
-    else:
-        await update.message.reply_text("❌ Error midiendo latencia.")
+def ensure_dir():
+    os.makedirs(CONF_DIR, exist_ok=True)
 
-@only_auth
-async def cmd_report(update, ctx):
-    ip = get_public_ip()
-    ok = container_ok()
-    code, out = container_exec(f"wg show {WG_INTERFACE}") if ok else (1, "")
-    peers = parse_wg_show(out) if ok else []
-    msg = (f"📋 Reporte\n🌐 IP pública: {ip}\n"
-           f"📦 WG: {'activo' if ok else 'inactivo'}\n"
-           f"👥 Peers: {len(peers)}")
-    await update.message.reply_text(msg)
-
-# ========= /addpeer =========
-@only_auth
-async def cmd_addpeer(update, ctx):
-    if not ctx.args:
-        await update.message.reply_text("Uso: /addpeer <nombre>")
-        return
-    peer_name = ctx.args[0].strip()
-    peers_json = "/configs/peers.json"
-    peer_file = f"/configs/{peer_name}.conf"
-
-    peers = {}
-    if os.path.exists(peers_json):
-        with open(peers_json) as f:
-            peers = json.load(f)
-
-    if peer_name in peers:
-        await update.message.reply_text(f"⚠️ Peer '{peer_name}' ya existe.")
-        return
-
-    try:
-        c = docker_client.containers.get(WG_CONTAINER_NAME)
-        private = c.exec_run("wg genkey").output.decode().strip()
-        public = c.exec_run(f"bash -c 'echo {private} | wg pubkey'").output.decode().strip()
-        new_ip = f"10.6.0.{len(peers)+2}/32"
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error generando claves: {e}")
-        return
-
-    peer_block = f"\n[Peer]\n# {peer_name}\nPublicKey = {public}\nAllowedIPs = {new_ip}\n"
-    container_exec(f"bash -c 'echo \"{peer_block}\" >> {WG_CONFIG_PATH}'")
-
-    server_pub = container_exec(f"wg show {WG_INTERFACE} public-key")[1].strip()
-    endpoint = container_exec(f"grep Endpoint {WG_CONFIG_PATH} | head -1 | awk '{{print $3}}'")[1].strip() or "example.com:51820"
-
-    conf = (
-        f"[Interface]\nPrivateKey = {private}\nAddress = {new_ip}\nDNS = 1.1.1.1\n\n"
-        f"[Peer]\nPublicKey = {server_pub}\nEndpoint = {endpoint}\n"
-        f"AllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n"
-    )
-    with open(peer_file, "w") as f:
-        f.write(conf)
-
-    peers[peer_name] = {"ip": new_ip, "public_key": public}
-    with open(peers_json, "w") as f:
-        json.dump(peers, f, indent=2)
-
-    await update.message.reply_document(open(peer_file, "rb"), filename=f"{peer_name}.conf")
-    await update.message.reply_text(f"✅ Peer '{peer_name}' creado con IP {new_ip}")
-
-# ========= MONITOR =========
-async def monitor(app):
+def next_peer_name():
+    existing = {os.path.splitext(os.path.basename(p))[0] for p in list_client_files()}
+    i = 1
     while True:
-        if not container_ok():
-            restarted = restart_wireguard()
-            if STATE.get("notifications", True):
-                for uid in AUTHORIZED_USERS:
-                    try:
-                        await app.bot.send_message(uid, "⚠️ WireGuard estaba caído y se ha reiniciado." if restarted else "❌ WireGuard caído y no se pudo reiniciar.")
-                    except:
-                        pass
-        await asyncio.sleep(PING_INTERVAL)
+        n = f"peer{i}"
+        if n not in existing:
+            return n
+        i += 1
 
-# ========= MAIN =========
+# =====================
+# Comandos de Telegram
+# =====================
+def cmd_help(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    text = (
+        "🤖 *WireGuardControlBot — Comandos*\n\n"
+        "/start — Resumen *visual*\n"
+        "/summary — Resumen *visual* sin tocar contenedor\n"
+        "/status — `wg show` crudo\n"
+        "/connections — Peers por estado (emoji) con nombre si existe\n"
+        "/listpeers — Nombre ↔ IP ↔ PublicKey (corto)\n"
+        "/addpeer [nombre] — Crear peer automático (si no hay nombre usa peerN)\n"
+        "/delpeer <nombre> — Eliminar peer por nombre\n"
+        "/stop — Parar WireGuard\n"
+        "/restart — Reiniciar WireGuard\n"
+        "/rebootbot — Reiniciar este bot\n"
+        "/logs — Últimos logs del contenedor WireGuard\n"
+        "/uptime — Uptime aproximado\n"
+        "/rebootpi — Intentar reiniciar la Raspberry\n"
+    )
+    context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode="Markdown")
+
+def cmd_status(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    wg = get_wg_show()
+    context.bot.send_message(chat_id=update.effective_chat.id, text=f"```\n{wg}\n```", parse_mode="Markdown")
+
+def cmd_summary(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    wg_status = get_wg_show()
+    pub_ip = get_public_ip()
+    domain = CF_RECORD_NAME if CF_RECORD_NAME else ""
+    visual = summarize_visual(wg_status, pub_ip, domain, "en marcha")
+    context.bot.send_message(chat_id=update.effective_chat.id, text=visual, parse_mode="Markdown")
+
+def cmd_connections(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    wg_text = get_wg_show()
+    peers = parse_connections(wg_text)
+    ip2name = build_name_map()
+    if not peers:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="No hay peers configurados.")
+        return
+    lines = ["📡 *Peers / Conexiones*"]
+    for i, p in enumerate(peers, 1):
+        allowed = p.get("allowed", "")
+        m = IP_RE.search(allowed); ip = m.group(1) if m else ""
+        name = ip2name.get(ip, "")
+        emoji, seen = human_last_seen(p["latest"])
+        who = f"`{name}`" if name else f"`{p['key'][:10]}…`"
+        ip_hint = f"({ip})" if ip else ""
+        lines.append(f"{i}. {emoji} {who} — {seen} {ip_hint}")
+    context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines), parse_mode="Markdown")
+
+def cmd_listpeers(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    wg_text = get_wg_show()
+    peers = parse_connections(wg_text)
+    ip2name = build_name_map()
+    if not peers:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="No hay peers configurados.")
+        return
+    lines = ["📄 *Nombre ↔ IP ↔ PublicKey (corto)*"]
+    for p in peers:
+        m = IP_RE.search(p.get("allowed","")); ip = m.group(1) if m else ""
+        name = ip2name.get(ip, "—")
+        shortkey = p["key"][:14] + "…"
+        lines.append(f"• `{name}`  —  {ip or '—'}  —  `{shortkey}`")
+    context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines), parse_mode="Markdown")
+
+def cmd_addpeer(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    ensure_dir()
+
+    # Nombre
+    name = (context.args[0].strip() if context.args else "").lower()
+    if not name:
+        name = next_peer_name()
+    if not re.match(r"^[a-z0-9_-]{1,32}$", name):
+        context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Nombre inválido. Usa [a-z0-9_-], máx 32 chars.")
+        return
+    if os.path.exists(os.path.join(CONF_DIR, f"{name}.conf")):
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Ya existe un peer llamado `{name}`.", parse_mode="Markdown")
+        return
+
+    # IP libre
+    client_ip = find_next_free_ip()
+    if not client_ip:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="❌ No encontré IP libre en la subred.")
+        return
+
+    # Claves
+    priv, pub = gen_keypair()
+    if not priv or not pub:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Error generando claves.")
+        return
+
+    # Info servidor
+    server_pub, listen_port = get_server_info()
+    endpoint = CF_RECORD_NAME or get_public_ip()
+    if not endpoint:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="❌ No pude determinar endpoint (dominio/IP).")
+        return
+
+    # 1) Añadir al servidor (en caliente)
+    add_cmd = f"wg set {WG_INTERFACE} peer {shlex.quote(pub)} allowed-ips {client_ip}/32"
+    out, err, rc = docker_exec(WG_DOCKER_CONTAINER, add_cmd)
+    if rc != 0:
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Error añadiendo peer al servidor:\n{err or out}")
+        return
+    docker_exec(WG_DOCKER_CONTAINER, f"wg-quick save {WG_INTERFACE} || true")
+
+    # 2) Crear .conf cliente
+    conf_tpl = create_client_conf(name, client_ip, server_pub, endpoint, listen_port)
+    conf_text = conf_tpl.replace("{CLIENT_PRIVATE}", priv)
+    conf_path, png_path, png_stream = save_qr_and_conf(name, conf_text)
+
+    # 3) Enviar resultado
+    msg = (
+        f"✅ *Peer creado:* `{name}`\n"
+        f"IP: `{client_ip}`\n"
+        f"PublicKey: `{pub}`\n"
+        f"Endpoint: `{endpoint}:{listen_port}`"
+    )
+    context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="Markdown")
+    # QR
+    context.bot.send_photo(chat_id=update.effective_chat.id, photo=png_stream, caption=f"QR para `{name}`")
+    # .conf
+    with open(conf_path, "rb") as f:
+        context.bot.send_document(chat_id=update.effective_chat.id, document=f, filename=os.path.basename(conf_path))
+
+def cmd_delpeer(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    if not context.args:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Uso: /delpeer <nombre>")
+        return
+    name = context.args[0]
+    client_path = os.path.join(CONF_DIR, f"{name}.conf")
+    if not os.path.exists(client_path):
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ No existe {client_path}")
+        return
+
+    # 1) IP del peer
+    ip = parse_client_address(client_path)
+    if not ip:
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ No pude obtener la IP de {name}.conf")
+        return
+
+    # 2) PublicKey desde wg show
+    wg_text = get_wg_show()
+    peers = parse_connections(wg_text)
+    pub = find_pubkey_by_allowed_ip(peers, ip)
+
+    # 3) Quitar del servidor y guardar
+    if pub:
+        docker_exec(WG_DOCKER_CONTAINER, f"wg set {WG_INTERFACE} peer {shlex.quote(pub)} remove || true")
+        docker_exec(WG_DOCKER_CONTAINER, f"wg-quick save {WG_INTERFACE} || true")
+
+    # 4) Borrar ficheros
+    try: os.remove(client_path)
+    except Exception: pass
+    try:
+        png = os.path.join(CONF_DIR, f"{name}.png")
+        if os.path.exists(png): os.remove(png)
+    except Exception: pass
+
+    # 5) Limpiar [Peer] de SERVER_WG0 por AllowedIPs
+    try:
+        if os.path.exists(SERVER_WG0):
+            with open(SERVER_WG0, "r") as f: text = f.read()
+            pattern = r"(?ms)^\[Peer\][^\[]*?AllowedIPs\s*=\s*%s/32\s*$" % re.escape(ip)
+            new_text = re.sub(pattern, "", text)
+            if new_text != text:
+                with open(SERVER_WG0, "w") as f: f.write(new_text)
+    except Exception:
+        pass
+
+    context.bot.send_message(chat_id=update.effective_chat.id, text=f"🗑️ Peer `{name}` eliminado (IP {ip}).", parse_mode="Markdown")
+
+def cmd_start(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    out, err, rc = run(["docker", "inspect", "-f", "{{.State.Running}}", WG_DOCKER_CONTAINER])
+    running_already = (rc == 0 and out.strip().lower() == "true")
+    started_action = "en marcha" if running_already else "iniciado"
+    if not running_already:
+        out, err, rc = run(["docker", "start", WG_DOCKER_CONTAINER])
+        if rc != 0:
+            context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ *Error al iniciar WireGuard*\n\n{err or out}", parse_mode="Markdown")
+            return
+    wg_status = get_wg_show()
+    pub_ip = get_public_ip()
+    domain = CF_RECORD_NAME if CF_RECORD_NAME else ""
+    visual = summarize_visual(wg_status, pub_ip, domain, started_action)
+    context.bot.send_message(chat_id=update.effective_chat.id, text=visual, parse_mode="Markdown")
+
+def cmd_stop(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    out, err, rc = run(["docker", "inspect", "-f", "{{.State.Running}}", WG_DOCKER_CONTAINER])
+    if rc == 0 and out.strip().lower() == "false":
+        context.bot.send_message(chat_id=update.effective_chat.id, text="🟡 *WireGuard ya estaba detenido*", parse_mode="Markdown")
+        return
+    out, err, rc = run(["docker", "stop", WG_DOCKER_CONTAINER])
+    msg = "🛑 *WireGuard detenido correctamente*" if rc == 0 else f"❌ *Error al detener WireGuard*\n\n{err or out}"
+    context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="Markdown")
+
+def cmd_restart(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    context.bot.send_message(chat_id=update.effective_chat.id, text="🔄 *Reiniciando WireGuard...*", parse_mode="Markdown")
+    out, err, rc = run(["docker", "restart", WG_DOCKER_CONTAINER])
+    if rc == 0:
+        wg_status = get_wg_show()
+        pub_ip = get_public_ip()
+        domain = CF_RECORD_NAME if CF_RECORD_NAME else ""
+        visual = summarize_visual(wg_status, pub_ip, domain, "reiniciado")
+        context.bot.send_message(chat_id=update.effective_chat.id, text=visual, parse_mode="Markdown")
+    else:
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ *Error al reiniciar WireGuard*\n\n{err or out}", parse_mode="Markdown")
+
+def cmd_rebootbot(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    this = os.environ.get("HOSTNAME", "wireguardcontrolbot").strip()
+    context.bot.send_message(chat_id=update.effective_chat.id, text=f"Reiniciando bot `{this}`...", parse_mode="Markdown")
+    run(["docker", "restart", this])
+
+def cmd_logs(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    out, err, rc = run(["docker", "logs", "--tail", "120", WG_DOCKER_CONTAINER])
+    text = out or err or "(sin logs)"
+    if len(text) > 3800: text = "…(recortado)\n" + text[-3500:]
+    context.bot.send_message(chat_id=update.effective_chat.id, text=f"```\n{text}\n```", parse_mode="Markdown")
+
+def cmd_uptime(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    out, err, rc = run(["cat", "/proc/uptime"])
+    if rc != 0 or not out:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="No pude leer el uptime.")
+        return
+    try: seconds = float(out.split()[0])
+    except Exception: seconds = 0.0
+    td = timedelta(seconds=int(seconds))
+    context.bot.send_message(chat_id=update.effective_chat.id, text=f"⏱️ *Uptime aproximado del sistema/bot:* {td}", parse_mode="Markdown")
+
+def cmd_rebootpi(update, context):
+    if not is_authorized(update.effective_user.id):
+        return
+    out, err, rc = run(["sh", "-lc", "reboot || shutdown -r now || systemctl reboot || echo 'Sin permisos para reiniciar'"])
+    if rc == 0 and not err and "Sin permisos" not in (out or ""):
+        msg = "♻️ *Intento de reinicio enviado.* Si el sistema tiene permisos, se reiniciará."
+    else:
+        msg = "❌ *No tengo permisos para reiniciar la Raspberry desde el contenedor.*"
+    context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="Markdown")
+
+# ===========================
+# Monitorización y alertas
+# ===========================
+def send_admin(bot, text, markdown=False):
+    if not ADMIN_CHAT_ID: return
+    kwargs = {"chat_id": int(ADMIN_CHAT_ID), "text": text}
+    if markdown: kwargs["parse_mode"] = "Markdown"
+    bot.send_message(**kwargs)
+
+def get_public_ip_safe():
+    try: return get_public_ip()
+    except Exception: return ""
+
+def monitor_loop(bot: telegram.Bot):
+    last_running = None
+    last_handshake_digest = ""
+    last_public_ip = ""
+    last_status_change_time = 0
+    last_uptime = 0
+
+    public_ip = get_public_ip_safe()
+    last_public_ip = public_ip or ""
+    msg = f"✅ *Bot iniciado*\nFecha: {now_str()}\nIP pública: [{public_ip or '—'}](https://{public_ip or ''})"
+    if CF_RECORD_NAME: msg += f"\nDominio: [{CF_RECORD_NAME}](https://{CF_RECORD_NAME})"
+    send_admin(bot, msg, markdown=True)
+
+    while True:
+        try:
+            # 1) Reinicio de Pi
+            out, err, rc = run(["cat", "/proc/uptime"])
+            if rc == 0 and out:
+                try: current_uptime = float(out.split()[0])
+                except Exception: current_uptime = 0.0
+                if last_uptime and current_uptime < last_uptime:
+                    send_admin(bot, f"⚠️ *Raspberry Pi se ha reiniciado*\nFecha: {now_str()}\nUptime actual: {int(current_uptime/60)} min", markdown=True)
+                last_uptime = current_uptime
+
+            # 2) Estado WireGuard
+            out, err, rc = run(["docker", "inspect", "-f", "{{.State.Running}}", WG_DOCKER_CONTAINER])
+            running = (out.strip().lower() == "true") if rc == 0 else False
+            now_ts = time.time()
+            if last_running is None:
+                last_running = running
+            elif running != last_running:
+                last_running = running
+                if running:
+                    if now_ts - last_status_change_time < 60:
+                        send_admin(bot, "🔄 *WireGuard se ha reiniciado automáticamente*", markdown=True)
+                    else:
+                        send_admin(bot, "🟢 *WireGuard se ha iniciado automáticamente*", markdown=True)
+                else:
+                    send_admin(bot, "🔴 *WireGuard se ha detenido*", markdown=True)
+                last_status_change_time = now_ts
+
+            # 3) Cambios en handshakes
+            wg_text = get_wg_show()
+            digest = ""
+            for p in parse_connections(wg_text):
+                digest += f"{p['key']}|{p['latest']}|"
+            if digest and digest != last_handshake_digest:
+                if last_handshake_digest != "":
+                    send_admin(bot, "🔔 Cambios en conexiones (handshakes). Usa /connections para ver detalle.")
+                last_handshake_digest = digest
+
+            # 4) IP + Cloudflare
+            if USE_CLOUDFLARE and CF_API_TOKEN and CF_ZONE_ID and CF_RECORD_NAME:
+                current_ip = get_public_ip_safe()
+                if current_ip and current_ip != last_public_ip:
+                    rec_id, rec_ip = cf_get_record_ip()
+                    if rec_id and rec_ip != current_ip:
+                        ok = cf_update_record_ip(rec_id, current_ip)
+                        if ok:
+                            send_admin(bot, f"⚠️ *IP pública cambiada* y Cloudflare actualizado ✅\nNueva IP: `{current_ip}`\nRegistro: `{CF_RECORD_NAME}`", markdown=True)
+                        else:
+                            send_admin(bot, f"❌ Error actualizando Cloudflare.\nIP deseada: {current_ip}\nRegistro: {CF_RECORD_NAME}")
+                    last_public_ip = current_ip
+
+        except Exception as e:
+            send_admin(bot, f"Monitor error: {e}")
+        finally:
+            time.sleep(max(60, min(PING_INTERVAL, 600)))
+
+# =======
+# Main
+# =======
 def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("restart", cmd_restart))
-    app.add_handler(CommandHandler("clients", cmd_clients))
-    app.add_handler(CommandHandler("latency", cmd_latency))
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("addpeer", cmd_addpeer))
-    app.job_queue.run_repeating(lambda _: asyncio.create_task(monitor(app)), interval=PING_INTERVAL, first=10)
-    log.info("WireGuardControlBot v2.1 iniciado.")
-    app.run_polling()
+    if not TELEGRAM_TOKEN:
+        print("ERROR: TELEGRAM_TOKEN no definido")
+        return
+
+    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("help",        cmd_help,        filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("status",      cmd_status,      filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("summary",     cmd_summary,     filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("connections", cmd_connections, filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("listpeers",   cmd_listpeers,   filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("addpeer",     cmd_addpeer,     filters=Filters.chat_type.private, pass_args=True))
+    dp.add_handler(CommandHandler("delpeer",     cmd_delpeer,     filters=Filters.chat_type.private, pass_args=True))
+    dp.add_handler(CommandHandler("start",       cmd_start,       filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("stop",        cmd_stop,        filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("restart",     cmd_restart,     filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("rebootbot",   cmd_rebootbot,   filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("logs",        cmd_logs,        filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("uptime",      cmd_uptime,      filters=Filters.chat_type.private))
+    dp.add_handler(CommandHandler("rebootpi",    cmd_rebootpi,    filters=Filters.chat_type.private))
+
+    t = threading.Thread(target=monitor_loop, args=(updater.bot,), daemon=True)
+    t.start()
+
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
     main()
