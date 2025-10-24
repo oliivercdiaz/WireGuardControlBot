@@ -1,69 +1,53 @@
-#!/bin/sh
-set -eu
+#!/bin/bash
+# /config/bin/wg-nat.sh - manejador seguro de NAT para WireGuard (Docker host mode compatible)
 
-if [ "$#" -lt 2 ]; then
-    echo "usage: $0 {up|down} <wg-interface>" >&2
-    exit 1
-fi
+set -e
 
 ACTION=$1
-WG_IFACE=$2
+INTERFACE=$2
 
-# Detect outbound interface, fallback to eth0
-OUT_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')
-if [ -z "$OUT_IFACE" ]; then
-    OUT_IFACE=$(ip -o -4 route show to default 2>/dev/null | awk 'NR==1 {print $5}')
-fi
-if [ -z "$OUT_IFACE" ]; then
-    OUT_IFACE="eth0"
-fi
-
-# Determine subnet (prefer INTERNAL_SUBNET env, fallback to interface address)
-WG_SUBNET=${INTERNAL_SUBNET:-}
-if [ -n "$WG_SUBNET" ]; then
-    case "$WG_SUBNET" in
-        */*) ;;
-        *) WG_SUBNET="${WG_SUBNET}/24" ;;
-    esac
-else
-    WG_SUBNET=$(ip -o -4 addr show dev "$WG_IFACE" 2>/dev/null | awk 'NR==1 {print $4}')
-fi
-
-if [ "$ACTION" = "up" ]; then
-    if [ -n "$WG_SUBNET" ]; then
-        if ! iptables -t nat -C POSTROUTING -s "$WG_SUBNET" -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null; then
-            iptables -t nat -A POSTROUTING -s "$WG_SUBNET" -o "$OUT_IFACE" -j MASQUERADE
-        fi
-    elif ! iptables -t nat -C POSTROUTING -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -o "$OUT_IFACE" -j MASQUERADE
-    fi
-
-    if ! iptables -C FORWARD -i "$WG_IFACE" -o "$OUT_IFACE" -j ACCEPT 2>/dev/null; then
-        iptables -A FORWARD -i "$WG_IFACE" -o "$OUT_IFACE" -j ACCEPT
-    fi
-
-    if ! iptables -C FORWARD -i "$OUT_IFACE" -o "$WG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
-        iptables -A FORWARD -i "$OUT_IFACE" -o "$WG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    fi
-elif [ "$ACTION" = "down" ]; then
-    if [ -n "$WG_SUBNET" ]; then
-        while iptables -t nat -C POSTROUTING -s "$WG_SUBNET" -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null; do
-            iptables -t nat -D POSTROUTING -s "$WG_SUBNET" -o "$OUT_IFACE" -j MASQUERADE
-        done
+case "$ACTION" in
+  up)
+    echo "[NAT] Activando NAT en $INTERFACE..."
+    # Evitar error: no se puede modificar sysctl en modo host
+    if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
+      echo "[NAT] Advertencia: El reenvío IP (ip_forward) está desactivado en el host."
+      echo "[NAT] Ejecute en el host: sudo sysctl -w net.ipv4.ip_forward=1"
     else
-        while iptables -t nat -C POSTROUTING -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null; do
-            iptables -t nat -D POSTROUTING -o "$OUT_IFACE" -j MASQUERADE
-        done
+      echo "[NAT] Reenvío IP ya está activo en el host."
     fi
 
-    while iptables -C FORWARD -i "$WG_IFACE" -o "$OUT_IFACE" -j ACCEPT 2>/dev/null; do
-        iptables -D FORWARD -i "$WG_IFACE" -o "$OUT_IFACE" -j ACCEPT
-    done
+    # Detectar interfaz de salida
+    OUT_IFACE=$(ip route get 1.1.1.1 | awk '/dev/ {print $5; exit}')
+    if [ -z "$OUT_IFACE" ]; then
+      OUT_IFACE="eth0"
+    fi
+    echo "[NAT] Usando interfaz de salida: $OUT_IFACE"
 
-    while iptables -C FORWARD -i "$OUT_IFACE" -o "$WG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do
-        iptables -D FORWARD -i "$OUT_IFACE" -o "$WG_IFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    done
-else
-    echo "usage: $0 {up|down} <wg-interface>" >&2
+    # Activar NAT si no existe
+    if ! iptables -t nat -C POSTROUTING -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null; then
+      iptables -t nat -A POSTROUTING -o "$OUT_IFACE" -j MASQUERADE
+      echo "[NAT] Regla NAT agregada en $OUT_IFACE"
+    else
+      echo "[NAT] Regla NAT ya existente, omitida."
+    fi
+    ;;
+  down)
+    echo "[NAT] Desactivando NAT en $INTERFACE..."
+    OUT_IFACE=$(ip route get 1.1.1.1 | awk '/dev/ {print $5; exit}')
+    if [ -z "$OUT_IFACE" ]; then
+      OUT_IFACE="eth0"
+    fi
+
+    if iptables -t nat -C POSTROUTING -o "$OUT_IFACE" -j MASQUERADE 2>/dev/null; then
+      iptables -t nat -D POSTROUTING -o "$OUT_IFACE" -j MASQUERADE
+      echo "[NAT] Regla NAT eliminada en $OUT_IFACE"
+    else
+      echo "[NAT] No se encontró regla NAT para eliminar."
+    fi
+    ;;
+  *)
+    echo "Uso: $0 {up|down} <interface>"
     exit 1
-fi
+    ;;
+esac

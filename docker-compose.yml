@@ -5,19 +5,20 @@ services:
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
-    ports:
-      - "51820:51820/udp"
+    network_mode: "host"
     environment:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
       - TZ=${TZ:-Europe/Madrid}
-      - SERVERURL=${SERVERURL:-vpn.example.com}
+      - SERVERURL=${SERVERURL:-vpn.olivercloud.es}
       - SERVERPORT=${SERVERPORT:-51820}
       - PEERS=${PEERS:-oliver,pc,phone}
       - PEERDNS=${PEERDNS:-1.1.1.1}
       - INTERNAL_SUBNET=${INTERNAL_SUBNET:-10.119.153.0/24}
+      - WG_QUICK_USERSPACE_IMPLEMENTATION=boringtun
     volumes:
       - ./configs:/config
+      - ./configs/bin:/config/bin
       - /lib/modules:/lib/modules
     restart: unless-stopped
 
@@ -25,7 +26,8 @@ services:
     build: ./bot
     container_name: wireguardcontrolbot
     network_mode: "host"
-    restart: unless-stopped
+    depends_on:
+      - wireguard
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
       - AUTHORIZED_USERS=${AUTHORIZED_USERS:-}
@@ -45,5 +47,4 @@ services:
     volumes:
       - ./configs:/config
       - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      - wireguard
+    restart: unless-stopped
