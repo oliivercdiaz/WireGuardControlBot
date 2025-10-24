@@ -77,15 +77,6 @@ Las órdenes anteriores confirman que la interfaz externa se detecta bien, que l
 
 > ℹ️ `/addpeer` y `/delpeer` también verifican que el contenedor `wireguard` y la interfaz `wg0` estén activos antes de tocar la configuración, evitando el error “Unable to modify interface: No such device”.
 
-### Acceso SSH desde Windows a través de WireGuard
-
-Si conectas un cliente Windows 11 y recibes errores `async io completed with error: 10013` o `10060` al usar `ssh`, revisa los pasos descritos en [docs/windows-wireguard-ssh.md](docs/windows-wireguard-ssh.md). Encontrarás instrucciones para:
-
-- Confirmar la IP real del servidor dentro del túnel (`10.119.153.1` por defecto) y evitar intentos hacia direcciones inexistentes como `10.8.0.1`.
-- Reaplicar las reglas de NAT (`/config/bin/wg-nat.sh up wg0`) y revisar `iptables` para asegurarte de que el tráfico del túnel puede salir hacia tu LAN.
-- Crear reglas de firewall en Windows que permitan a `ssh.exe` usar el adaptador WireGuard y autoricen la subred doméstica (`192.168.1.0/24`).
-- Repetir la conexión con `ssh -vvv` y comprobar en los logs del servidor (`journalctl -u ssh`) que el intento llega desde la IP del peer.
-
 ## Servicios systemd
 Si prefieres systemd en lugar de Docker Compose, puedes usar `systemd/wireguardcontrolbot.service` como base. Ajusta las rutas y variables según tu despliegue.
 

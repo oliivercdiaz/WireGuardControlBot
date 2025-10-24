@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   wireguard:
     image: linuxserver/wireguard
@@ -7,6 +5,8 @@ services:
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
+    ports:
+      - "51820:51820/udp"
     environment:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
@@ -16,37 +16,28 @@ services:
       - PEERS=${PEERS:-oliver,pc,phone}
       - PEERDNS=${PEERDNS:-1.1.1.1}
       - INTERNAL_SUBNET=${INTERNAL_SUBNET:-10.119.153.0/24}
-    sysctls:
-      - net.ipv4.ip_forward=1
-      - net.ipv6.conf.all.disable_ipv6=0
-      - net.ipv6.conf.all.forwarding=1
     volumes:
       - ./configs:/config
-      - /lib/modules:/lib/modules:ro
-    ports:
-      - "${SERVERPORT:-51820}:${SERVERPORT:-51820}/udp"
+      - /lib/modules:/lib/modules
     restart: unless-stopped
 
   bot:
     build: ./bot
     container_name: wireguardcontrolbot
-    depends_on:
-      - wireguard
+    network_mode: "host"
+    restart: unless-stopped
     environment:
-      # --- Telegram ---
-      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
-      - AUTHORIZED_USERS=${AUTHORIZED_USERS}
-      - ADMIN_CHAT_ID=${ADMIN_CHAT_ID}
-      # --- WireGuard integration ---
-      - WG_INTERFACE=wg0
-      - WG_CONFIG_PATH=/config/wg_confs/wg0.conf
-      - WG_CLIENTS_DIR=/config/wg_confs
-      - WG_DOCKER_CONTAINER=wireguard
-      - WG_MTU=1420
-      - WG_CLIENT_DNS=1.1.1.1
-      - WG_DEBUG_SCRIPT=/config/bin/wg-peer-debug.sh
-      - PING_INTERVAL=600
-      # --- Cloudflare optional ---
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - AUTHORIZED_USERS=${AUTHORIZED_USERS:-}
+      - ADMIN_CHAT_ID=${ADMIN_CHAT_ID:-}
+      - WG_INTERFACE=${WG_INTERFACE:-wg0}
+      - WG_CONFIG_PATH=${WG_CONFIG_PATH:-/config/wg_confs/wg0.conf}
+      - WG_CLIENTS_DIR=${WG_CLIENTS_DIR:-/config/wg_confs}
+      - WG_DOCKER_CONTAINER=${WG_DOCKER_CONTAINER:-wireguard}
+      - WG_MTU=${WG_MTU:-1420}
+      - WG_CLIENT_DNS=${WG_CLIENT_DNS:-1.1.1.1}
+      - WG_DEBUG_SCRIPT=${WG_DEBUG_SCRIPT:-/config/bin/wg-peer-debug.sh}
+      - PING_INTERVAL=${PING_INTERVAL:-600}
       - USE_CLOUDFLARE=${USE_CLOUDFLARE:-false}
       - CF_API_TOKEN=${CF_API_TOKEN:-}
       - CF_ZONE_ID=${CF_ZONE_ID:-}
@@ -54,7 +45,5 @@ services:
     volumes:
       - ./configs:/config
       - /var/run/docker.sock:/var/run/docker.sock
-    restart: unless-stopped
-    # 👇 Importante para red estable y SSH funcional
-    network_mode: "host"
-    privileged: true
+    depends_on:
+      - wireguard
